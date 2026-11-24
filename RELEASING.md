@@ -13,7 +13,11 @@ of an upstream binary containing the cancellation race.
 3. Download `checksum.exs` from that release and commit it without changing native
    sources. Consumers pin this checksum-bearing commit. The release tag identifies
    the native source; the later commit adds only its verified checksum manifest.
-4. Verify an uncached consumer downloads the release archive, then update its pin.
+4. Dispatch `precompile` with `consumer_only=true` on the checksum-bearing commit.
+   This downloads the published binary into an empty cache on Electra's OTP 28
+   runtime, blocks source compilation, and runs the suite plus DuckDB 2.0.0 query
+   and IPC cancellation probes. Verify the local developer platform too, then
+   update the consumer pin.
 
 Archives target NIF ABI 2.17 (OTP 26 or newer). Linux builds use Ubuntu 22.04;
 consumers need compatible glibc and C++ runtime libraries. musl is not included.
