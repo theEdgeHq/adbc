@@ -6,120 +6,146 @@ on:
     tags:
       - "v*"
 
-env:
-  CI: true
-
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CI: "true"
+  ELIXIR_MAKE_CACHE_DIR: ${{ github.workspace }}/cache
 
 jobs:
-  linux:
-    runs-on: ubuntu-22.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            name: linux
+          - os: macos-15
+            name: macos
+          - os: windows-2022
+            name: windows
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     env:
       MIX_ENV: prod
-
-    name: Linux GNU - OTP ${{ matrix.otp_version }}
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install system dependecies
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        if: runner.os != 'macOS'
+        with:
+          otp-version: "26.2"
+          elixir-version: "1.15.8"
+      - name: Install macOS OTP and Elixir
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSO https://elixir-lang.org/install.sh
+          sh install.sh elixir@1.15.8 otp@26.2
+          echo "$HOME/.elixir-install/installs/otp/26.2/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.elixir-install/installs/elixir/1.15.8-otp-26/bin" >> "$GITHUB_PATH"
+      - uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.6"
+      - name: Install Linux cross compiler
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential automake autoconf pkg-config bc m4 unzip zip \
-            gcc g++ \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Precompile patched native libraries
+        shell: bash
+        run: |
+          elixir .github/scripts/checksums_test.exs
+          mix deps.get
+          mix elixir_make.precompile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nif-${{ matrix.name }}
+          path: |
+            cache/adbc*.tar.gz
+            cache/adbc*.sha256
+          if-no-files-found: error
 
+  verify:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      MIX_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        if: runner.os != 'macOS'
+        with:
+          otp-version: "26.2"
+          elixir-version: "1.15.8"
+      - name: Install macOS OTP and Elixir
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSO https://elixir-lang.org/install.sh
+          sh install.sh elixir@1.15.8 otp@26.2
+          echo "$HOME/.elixir-install/installs/otp/26.2/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.elixir-install/installs/elixir/1.15.8-otp-26/bin" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nif-*
+          path: cache
+          merge-multiple: true
+      - name: Verify archives and generate the consumer checksum manifest
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/.*@version "\([^"]*\)"/\1/p' mix.exs)
+          elixir .github/scripts/checksums.exs cache "$VERSION"
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          mix deps.get
+          mix deps.compile
+      - name: Require precompiled ADBC and run its regression suite
+        shell: bash
+        run: |
+          mkdir -p no-source-build
+          printf '#!/bin/sh\necho "ADBC source build was unexpectedly attempted" >&2\nexit 99\n' > no-source-build/cmake
+          chmod +x no-source-build/cmake
+          export PATH="$PWD/no-source-build:$PATH"
+          mix test --exclude postgresql
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: verify
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "26.2"
           elixir-version: "1.15.8"
-
-      - name: Precompile
-        run: |
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
-          mkdir -p "${ELIXIR_MAKE_CACHE_DIR}"
-          mix deps.get
-          mix elixir_make.precompile
-
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+      - uses: actions/download-artifact@v4
         with:
+          pattern: nif-*
+          path: cache
+          merge-multiple: true
+      - name: Generate checked release manifest
+        run: |
+          VERSION=$(sed -n 's/.*@version "\([^"]*\)"/\1/p' mix.exs)
+          test "$GITHUB_REF_NAME" = "v$VERSION"
+          elixir .github/scripts/checksums.exs cache "$VERSION"
+      - uses: softprops/action-gh-release@v2
+        with:
+          make_latest: false
+          fail_on_unmatched_files: true
+          body: Patched ADBC native libraries. All five target archives passed the native regression suite before publication. Commit checksum.exs before updating consumers.
           files: |
             cache/adbc*.tar.gz
             cache/adbc*.sha256
-
-  macos:
-    runs-on: macos-14
-    env:
-      MIX_ENV: prod
-      OTP_VERSION: "26.2"
-      ELIXIR_VERSION: "1.15.8"
-
-    name: macOS
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install OTP and Elixir
-        run: |
-          curl -fsSO https://elixir-lang.org/install.sh
-          sh install.sh "elixir@${ELIXIR_VERSION}" "otp@${OTP_VERSION}"
-
-      - name: Precompile
-        run: |
-          export OTP_MAIN_VER="${OTP_VERSION%%.*}"
-          export PATH=$HOME/.elixir-install/installs/otp/${OTP_VERSION}/bin:$PATH
-          export PATH=$HOME/.elixir-install/installs/elixir/${ELIXIR_VERSION}-otp-${OTP_MAIN_VER}/bin:$PATH
-
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
-          mkdir -p "${ELIXIR_MAKE_CACHE_DIR}"
-
-          mix local.hex --force
-          mix local.rebar --force
-          mix deps.get
-          mix elixir_make.precompile
-
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            cache/adbc*.tar.gz
-            cache/adbc*.sha256
-
-  windows:
-    runs-on: windows-2022
-    env:
-      MIX_ENV: prod
-
-    name: Windows - OTP ${{ matrix.otp_version }}
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: 26
-          elixir-version: 1.15
-
-      - uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-
-      - name: Precompile
-        shell: bash
-        run: |
-          export ELIXIR_MAKE_CACHE_DIR=$(pwd)/cache
-          mkdir -p "${ELIXIR_MAKE_CACHE_DIR}"
-          mix deps.get
-          mix elixir_make.precompile
-
-      - uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            cache/adbc*.tar.gz
-            cache/adbc*.sha256
+            checksum.exs
