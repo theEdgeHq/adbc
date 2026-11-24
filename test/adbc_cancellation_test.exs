@@ -16,7 +16,10 @@ defmodule Adbc.CancellationTest do
           System.find_executable("elixir"),
           paths ++ [Path.join(__DIR__, "support/cancel_reader.ex"), mode],
           stderr_to_stdout: true,
-          env: [{"ERL_CRASH_DUMP", Path.join(System.tmp_dir!(), "adbc-cancellation.dump")}]
+          env: [
+            {"ADBC_TEST_EBIN", Adbc |> :code.which() |> Path.dirname()},
+            {"ERL_CRASH_DUMP", Path.join(System.tmp_dir!(), "adbc-cancellation.dump")}
+          ]
         )
 
       assert status == 0, output

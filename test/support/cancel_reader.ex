@@ -12,6 +12,10 @@ defmodule Adbc.CancellationReader do
   end
 end
 
+if ebin = System.get_env("ADBC_TEST_EBIN") do
+  true = :code.replace_path(:adbc, String.to_charlist(ebin))
+end
+
 {:ok, _} = Application.ensure_all_started(:adbc)
 
 database_options =
