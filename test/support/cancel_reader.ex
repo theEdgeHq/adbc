@@ -1,3 +1,17 @@
+defmodule Adbc.CancellationReader do
+  def await_started(reader) do
+    receive do
+      {:started, ^reader} -> :ok
+    end
+  end
+
+  def await_down(monitor, reader) do
+    receive do
+      {:DOWN, ^monitor, :process, ^reader, _reason} -> :ok
+    end
+  end
+end
+
 {:ok, _} = Application.ensure_all_started(:adbc)
 
 database_options =
@@ -28,16 +42,12 @@ for iteration <- 1..100 do
       end
     end)
 
-  receive do
-    {:started, ^reader} -> :ok
-  end
+  Adbc.CancellationReader.await_started(reader)
 
   Process.sleep(rem(iteration, 10) + 1)
   Process.exit(reader, :kill)
 
-  receive do
-    {:DOWN, ^monitor, :process, ^reader, _reason} -> :ok
-  end
+  Adbc.CancellationReader.await_down(monitor, reader)
 
   %{"answer" => [42]} =
     connection
