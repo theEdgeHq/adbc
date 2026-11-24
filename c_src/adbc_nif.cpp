@@ -2,6 +2,7 @@
 #include <cstdbool>
 #include <cstdio>
 #include <fine.hpp>
+#include <mutex>
 #include <nanoarrow/nanoarrow.h>
 #include <nanoarrow/nanoarrow_ipc.h>
 #include <nanoarrow/nanoarrow_ipc.hpp>
@@ -50,10 +51,13 @@ struct AdbcStatementResource {
 FINE_RESOURCE(AdbcStatementResource);
 
 struct ArrowArrayStreamResource {
+  // Keep the statement alive until after the stream and schema are released.
+  fine::ResourcePtr<AdbcStatementResource> statement;
+  // A caller can die while its dirty NIF is still running. The connection's
+  // DOWN handler must wait for that read before releasing the native stream.
+  std::mutex mutex;
   nanoarrow::UniqueArrayStream stream;
   nanoarrow::UniqueSchema schema;
-  // Keeps the statement alive while reading.
-  fine::ResourcePtr<AdbcStatementResource> statement;
 };
 FINE_RESOURCE(ArrowArrayStreamResource);
 
@@ -471,6 +475,7 @@ AdbcResult<>
 adbc_statement_bind_stream(ErlNifEnv *env,
                            fine::ResourcePtr<AdbcStatementResource> stmt,
                            fine::ResourcePtr<ArrowArrayStreamResource> stream) {
+  std::lock_guard<std::mutex> lock(stream->mutex);
   struct AdbcError adbc_error{};
   auto code =
       AdbcStatementBindStream(&stmt->value, stream->stream.get(), &adbc_error);
@@ -502,6 +507,7 @@ FINE_NIF(adbc_arrow_array_stream_from_pointer, 0);
 AdbcResult<fine::Term>
 adbc_arrow_array_stream_next(ErlNifEnv *env,
                              fine::ResourcePtr<ArrowArrayStreamResource> res) {
+  std::lock_guard<std::mutex> lock(res->mutex);
   nanoarrow::UniqueArray array;
   fine::Term out_term;
 
@@ -545,6 +551,7 @@ FINE_NIF(adbc_arrow_array_stream_next, ERL_NIF_DIRTY_JOB_IO_BOUND);
 
 fine::Ok<> adbc_arrow_array_stream_release(
     ErlNifEnv *env, fine::ResourcePtr<ArrowArrayStreamResource> res) {
+  std::lock_guard<std::mutex> lock(res->mutex);
   res->stream.reset();
   return fine::Ok<>();
 }
@@ -591,6 +598,7 @@ FINE_NIF(adbc_ipc_load_stream_binary, ERL_NIF_DIRTY_JOB_CPU_BOUND);
 AdbcResult<std::string>
 adbc_ipc_dump_stream_ref(ErlNifEnv *env,
                          fine::ResourcePtr<ArrowArrayStreamResource> res) {
+  std::lock_guard<std::mutex> lock(res->mutex);
   if (res->stream->release == nullptr) {
     return fine::Error(ExArgumentError("stream has already been consumed"));
   }
